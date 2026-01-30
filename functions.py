@@ -23,6 +23,34 @@ api_key = os.getenv('CLOSE_API_KEY_MARY')
 api = Client(api_key)
 
 
+def df_to_sheets_report(data_frame):
+    """Преобразует pandas-датафрейм в список списков подходящий для записи в гугл-таблицу"""
+    data_frame.fillna('', inplace=True)
+    sheets_report = [data_frame.columns.tolist()] + data_frame.values.tolist()
+    return sheets_report
+
+
+def write_spread_sheet(spread, sheet, report):
+    """Перезаписывает лист гугл таблицы"""
+    sh = gc.open(spread)
+    worksheet = sh.worksheet(sheet)
+    worksheet.clear()
+    print(f"Лист {sheet} в таблице {spread} очищен")
+
+    # Получить размеры отчета (количество строк и столбцов)
+    num_rows = len(report)
+    num_cols = len(report[0])
+
+    # Получить диапазон для записи данных
+    start_cell = rowcol_to_a1(1, 1)
+    end_cell = rowcol_to_a1(num_rows, num_cols)
+
+    # Записать значения в диапазон
+    cell_range = f"{start_cell}:{end_cell}"
+    worksheet.update(report, cell_range, value_input_option="user_entered")
+
+    print("Отчет записан")
+
 
 def get_objects(json_query, only_totals=False):
     """Получение сущностей по json-запросу"""
