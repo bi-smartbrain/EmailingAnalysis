@@ -23,6 +23,17 @@ api_key = os.getenv('CLOSE_API_KEY_MARY')
 api = Client(api_key)
 
 
+def df_columns_add_hours(df, columns=None, delta=3):
+    """Приводит колонки в датафрейме к МСК времени, добавляя опциональное количество часов"""
+    if columns is None:
+        columns = ['date_created', 'date_sent']
+    for col in columns:
+        df[col] = df[col].str[:19]
+        df[col] = pd.to_datetime(df[col]) + dt.timedelta(hours=delta)
+
+    return df
+
+
 def df_to_sheets_report(data_frame):
     """Преобразует pandas-датафрейм в список списков подходящий для записи в гугл-таблицу"""
     data_frame.fillna('', inplace=True)
@@ -52,8 +63,10 @@ def write_spread_sheet(spread, sheet, report):
     print("Отчет записан")
 
 
-def get_objects(json_query, only_totals=False):
+def get_objects(json_query, only_totals=False, fields_lst=None):
     """Получение сущностей по json-запросу"""
+    if fields_lst:
+        json_query['_fields'] = {"activity.email": fields_lst}
     json_query['include_counts'] = True
     if only_totals:
         response = api.post('data/search/', data=json_query)
@@ -238,179 +251,33 @@ def get_sent_emails(after_dt, before_dt, fields_lst=None, only_totals=False, lea
     return resp
 
 
-def extract_subject_key_improved(
-        subject: str,
-        known_phrases: Optional[List[str]] = None,
-        all_subjects: Optional[List[str]] = None,
-        min_phrase_words: int = 4,
-        min_percentage: float = 1.0,
-        min_absolute_count: int = 3,
-        prefer_shorter_common: bool = True  # Новый параметр!
-) -> Optional[str]:
-    """
-    Извлекает ключевую фразу из темы письма.
-    prefer_shorter_common: если True, предпочитает более короткие общие фразы
-    """
-
-    @lru_cache(maxsize=10000)
-    def clean_text_cached(text: str) -> str:
-        """Очищает текст."""
-        text = re.sub(r'^(Re:|Fwd:|Fw:|🚀|📧|\s*[-–—|]*\s*)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'[|/\\–—]', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip().lower()
-        return text
-
-    def get_ngrams(text: str, min_n: int, max_n: int) -> List[str]:
-        """Генерирует n-граммы."""
-        words = text.split()
-        ngrams = []
-        for n in range(min_n, min(max_n, len(words)) + 1):
-            for i in range(len(words) - n + 1):
-                ngram = ' '.join(words[i:i + n])
-                ngrams.append(ngram)
-        return ngrams
-
-    # ШАГ 1: Очищаем тему
-    cleaned_subject = clean_text_cached(subject)
-    if not cleaned_subject:
-        return None
-
-    # ШАГ 2: Проверяем известные фразы
-    if known_phrases:
-        for phrase in known_phrases:
-            if clean_text_cached(phrase) in cleaned_subject:
-                return phrase
-
-    # ШАГ 3: Находим ВСЕ подходящие фразы из частотных
-    if all_subjects:
-        cleaned_all = [clean_text_cached(s) for s in all_subjects if s]
-        total_subjects = len(cleaned_all)
-
-        # Динамический порог
-        dynamic_min_count = max(min_absolute_count, int(total_subjects * min_percentage / 100))
-
-        # Собираем и считаем n-граммы
-        all_ngrams = []
-        for s in cleaned_all:
-            ngrams = get_ngrams(s, min_phrase_words, min_phrase_words + 4)  # +4 для гибкости
-            all_ngrams.extend(ngrams)
-
-        ngram_counts = Counter(all_ngrams)
-
-        # Находим все фразы, которые подходят для текущей темы
-        candidate_phrases = []
-        for ngram, count in ngram_counts.items():
-            if count >= dynamic_min_count and ngram in cleaned_subject:
-                candidate_phrases.append((ngram, count, len(ngram.split())))
-
-        # Если нашли кандидатов, выбираем лучшего
-        if candidate_phrases:
-            if prefer_shorter_common:
-                # Сортируем: сначала по частоте, потом по длине (предпочитаем короче)
-                candidate_phrases.sort(key=lambda x: (-x[1], x[2], x[0]))
-            else:
-                # Сортируем: сначала по длине (предпочитаем длиннее), потом по частоте
-                candidate_phrases.sort(key=lambda x: (-x[2], -x[1], x[0]))
-
-            best_phrase = candidate_phrases[0][0]
-            return ' '.join(word.capitalize() for word in best_phrase.split())
-
-    # Если ничего не нашли
-    return None
-
-
-def add_subject_key_into_emails(emails, known_phrases=None, update_phrases=True):
+def add_subject_key_into_emails(emails, known_phrases):
     """
     Ищет ключевые фразы в теме письма и добавляет ее в поле subject_key.
-    Инкрементально обновляет список известных фраз.
 
     Args:
         emails: список словарей с данными писем (должен содержать 'subject')
-        known_phrases: начальный список известных фраз (опционально)
-        update_phrases: обновлять ли список фраз в процессе (True по умолчанию)
+        known_phrases: начальный список известных фраз
 
     Returns:
-        dict: {
-            'emails': список писем с добавленным 'subject_key',
-            'phrases': обновленный список известных фраз,
-            'phrase_stats': статистика по фразам (Counter),
-            'coverage': процент писем, получивших subject_key
-        }
+        'emails': обработанный список писем с добавленным 'subject_key, если найден',
     """
-    if known_phrases is None:
-        known_phrases = []
 
-    # Создаем копию списка фраз для модификации
-    current_phrases = known_phrases.copy()
     email_results = []
-    phrase_counter = Counter()
+    for email in emails:
+        email_with_key = email.copy()
+        email_with_key['subject_key'] = None  # Инициализируем пустым
 
-    # Собираем все темы для анализа в extract_subject_key_improved
-    all_subjects = [email['subject'] for email in emails]
+        # Ищем первую подходящую фразу
+        for phrase in known_phrases:
+            if phrase.lower() in email['subject'].lower():
+                email_with_key['subject_key'] = phrase
+                break  # Прерываем поиск после первого совпадения
 
-    print(f"Обработка {len(emails)} писем...")
-    print(f"Начальный список фраз: {len(current_phrases)}")
-
-    for email in tqdm(emails, desc="Обработка писем"):
-        # Извлекаем ключевую фразу из темы
-        subject_key = extract_subject_key_improved(
-            subject=email['subject'],
-            known_phrases=current_phrases,
-            all_subjects=all_subjects,
-            min_phrase_words=4,
-            min_percentage=0.05,
-            min_absolute_count=2
-        )
-
-        # Добавляем результат к email
-        email_with_key = email.copy()  # Создаем копию, чтобы не модифицировать исходный
-        email_with_key['subject_key'] = subject_key
+        # Добавляем обработанное письмо в результаты
         email_results.append(email_with_key)
 
-        # Обновляем статистику
-        if subject_key and subject_key != 'unknown':
-            phrase_counter[subject_key] += 1
-
-        # Инкрементально обновляем список фраз
-        if update_phrases and subject_key and subject_key != 'unknown':
-            if subject_key not in current_phrases:
-                # Проверяем, не является ли новая фраза подфразой существующей
-                is_subphrase = False
-                for existing_phrase in current_phrases:
-                    if subject_key in existing_phrase or existing_phrase in subject_key:
-                        # Оставляем более длинную фразу
-                        if len(subject_key) > len(existing_phrase):
-                            current_phrases.remove(existing_phrase)
-                            current_phrases.append(subject_key)
-                            print(f"Обновлена фраза: '{existing_phrase}' → '{subject_key}'")
-                        is_subphrase = True
-                        break
-
-                if not is_subphrase:
-                    current_phrases.append(subject_key)
-
-    # Сортируем фразы по частоте использования
-    sorted_phrases = sorted(current_phrases,
-                            key=lambda x: phrase_counter.get(x, 0),
-                            reverse=True)
-
-    # Вычисляем покрытие
-    emails_with_key = sum(1 for email in email_results
-                          if email.get('subject_key') and email['subject_key'] != 'unknown')
-    coverage = (emails_with_key / len(email_results)) * 100 if email_results else 0
-
-    print(f"\nРезультаты:")
-    print(f"- Обработано писем: {len(email_results)}")
-    print(f"- Писем с определенной темой: {emails_with_key} ({coverage:.1f}%)")
-    print(f"- Уникальных фраз: {len(sorted_phrases)}")
-    print(f"- Топ-5 фраз: {list(phrase_counter.most_common(5))}")
-
-    return {
-        'emails': email_results,
-        'phrases': sorted_phrases,
-        'phrase_stats': dict(phrase_counter.most_common()),
-        'coverage': coverage
-    }
+    return email_results
 
 
 def create_date_ranges(start_dt: dt.datetime,
